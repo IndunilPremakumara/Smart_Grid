@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alert_rules.yml
+
+scrape_configs:
+  - job_name: stream-producer
+    static_configs:
+      - targets: ["stream-producer:9101"]
+
+  - job_name: batch-producer
+    static_configs:
+      - targets: ["batch-producer:9102"]
+
+  - job_name: speed-layer
+    static_configs:
+      - targets: ["speed-layer:9103"]
+
+  - job_name: serving-api
+    static_configs:
+      - targets: ["api:8000"]
+    metrics_path: /metrics

@@ -1,0 +1,88 @@
+groups:
+  - name: smartgrid_pipeline
+    rules:
+
+      # -----------------------------------------------------------------------
+      # Ingestion health
+      # -----------------------------------------------------------------------
+
+      # No records produced for 2 minutes: producer crashed or Kafka unreachable.
+      - alert: StreamProducerSilent
+        expr: |
+          (time() - grid_last_record_unixtime{component="stream-producer"}) > 120
+        for: 1m
+        labels:
+          severity: critical
+          layer: ingestion
+        annotations:
+          summary: "Stream producer has not emitted for >2 min"
+          description: "Staleness={{ $value | humanizeDuration }}. Check Kafka connectivity."
+
+      # -----------------------------------------------------------------------
+      # Speed-layer health
+      # -----------------------------------------------------------------------
+
+      # Speed layer stopped writing zone windows.
+      - alert: SpeedLayerSilent
+        expr: |
+          (time() - grid_last_record_unixtime{component="speed-layer"}) > 180
+        for: 1m
+        labels:
+          severity: critical
+          layer: speed
+        annotations:
+          summary: "Speed layer has not written zone windows for >3 min"
+          description: "Staleness={{ $value | humanizeDuration }}. Spark streaming query may have stopped."
+
+      # Error rate above 5% in the last 5 minutes.
+      - alert: SpeedLayerHighErrorRate
+        expr: |
+          rate(grid_errors_total{component="speed-layer"}[5m]) /
+          (rate(grid_records_total{component="speed-layer"}[5m]) + 0.001) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          layer: speed
+        annotations:
+          summary: "Speed layer error rate above 5%"
+          description: "Error ratio={{ $value | humanizePercentage }}."
+
+      # -----------------------------------------------------------------------
+      # Business alerts (grid state)
+      # -----------------------------------------------------------------------
+
+      # A zone's renewable contribution has dropped below the configured floor.
+      - alert: LowRenewableContribution
+        expr: grid_zone_renewable_pct < 15
+        for: 30s
+        labels:
+          severity: warning
+          layer: business
+        annotations:
+          summary: "Zone {{ $labels.grid_zone }} renewable contribution below 15%"
+          description: "Current={{ $value | humanize }}%. Solar generation may have failed or it is nighttime."
+
+      # A zone is reporting no active meters.
+      - alert: ZoneSilent
+        expr: grid_active_meters == 0
+        for: 1m
+        labels:
+          severity: critical
+          layer: business
+        annotations:
+          summary: "Zone {{ $labels.grid_zone }} has zero active meters"
+          description: "No readings received. Possible meter connectivity outage."
+
+      # -----------------------------------------------------------------------
+      # Serving API health
+      # -----------------------------------------------------------------------
+
+      - alert: APIDown
+        expr: up{job="serving-api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          layer: serving
+        annotations:
+          summary: "Serving API is unreachable"
+          description: "Prometheus cannot scrape the API. Container may have crashed."
