@@ -1,0 +1,394 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: smartgrid-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: smartgrid-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-grid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gridpass}
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # 00_ runs first and creates the airflow database
+      - ./sql/create_airflow_db.sh:/docker-entrypoint-initdb.d/00_create_dbs.sh:ro
+      # 01_ creates the smartgrid schema, tables and views
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-grid} -d ${POSTGRES_DB:-smartgrid}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: smartgrid-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      # Use curl against the MinIO health endpoint — mc is not in the server image
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Spark cluster
+  # ---------------------------------------------------------------------------
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.spark
+    image: smartgrid-spark:latest
+    container_name: smartgrid-spark-master
+    command:
+      - spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    environment:
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "7077:7077"
+      - "8083:8080"
+    volumes:
+      - spark-logs:/opt/spark-logs
+      - ./common:/opt/pipeline/common:ro
+      - ./streaming:/opt/pipeline/streaming:ro
+      - ./batch:/opt/pipeline/batch:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ | grep -q 'Spark Master' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 25s
+
+  spark-worker:
+    image: smartgrid-spark:latest
+    container_name: smartgrid-spark-worker
+    command:
+      - spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --cores
+      - "${SPARK_WORKER_CORES:-2}"
+      - --memory
+      - "${SPARK_WORKER_MEMORY:-2G}"
+      - --webui-port
+      - "8081"
+      - spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2G}
+      SPARK_WORKER_WEBUI_PORT: 8081
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "8081:8081"
+    volumes:
+      - spark-logs:/opt/spark-logs
+      - ./common:/opt/pipeline/common:ro
+      - ./streaming:/opt/pipeline/streaming:ro
+      - ./batch:/opt/pipeline/batch:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Pipeline services
+  # ---------------------------------------------------------------------------
+
+  stream-producer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    image: smartgrid-stream-producer:latest
+    container_name: smartgrid-stream-producer
+    command: ["python", "producers/stream_meters.py"]
+    env_file: .env
+    environment:
+      PYTHONPATH: /opt/pipeline
+      PYTHONUNBUFFERED: "1"
+      METRICS_PORT: "9101"
+    volumes:
+      - ./common:/opt/pipeline/common:ro
+      - ./producers:/opt/pipeline/producers:ro
+    ports:
+      - "9101:9101"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  batch-producer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    image: smartgrid-batch-producer:latest
+    container_name: smartgrid-batch-producer
+    command: ["python", "producers/batch_tariffs.py"]
+    env_file: .env
+    environment:
+      PYTHONPATH: /opt/pipeline
+      PYTHONUNBUFFERED: "1"
+      METRICS_PORT: "9102"
+    volumes:
+      - ./common:/opt/pipeline/common:ro
+      - ./producers:/opt/pipeline/producers:ro
+    ports:
+      - "9102:9102"
+    depends_on:
+      minio:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+
+  speed-layer:
+    image: smartgrid-spark:latest
+    container_name: smartgrid-speed-layer
+    command: >
+      spark-submit
+        --master ${SPARK_MASTER_URL:-spark://spark-master:7077}
+        --deploy-mode client
+        --conf spark.driver.host=speed-layer
+        --conf spark.driver.bindAddress=0.0.0.0
+        --conf spark.sql.shuffle.partitions=8
+        --conf spark.executor.memory=1g
+        --conf spark.cores.max=2
+        /opt/pipeline/streaming/speed_layer.py
+    env_file: .env
+    environment:
+      PYTHONPATH: /opt/pipeline
+      PYTHONUNBUFFERED: "1"
+      METRICS_PORT: "9103"
+    volumes:
+      - ./common:/opt/pipeline/common:ro
+      - ./streaming:/opt/pipeline/streaming:ro
+      - ./batch:/opt/pipeline/batch:ro
+    ports:
+      - "9103:9103"
+      - "4040:4040"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: on-failure
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    image: smartgrid-api:latest
+    container_name: smartgrid-api
+    command: ["uvicorn", "serving.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    env_file: .env
+    environment:
+      PYTHONPATH: /opt/pipeline
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./common:/opt/pipeline/common:ro
+      - ./serving:/opt/pipeline/serving:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # Airflow
+  # ---------------------------------------------------------------------------
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    image: smartgrid-airflow:latest
+    container_name: smartgrid-airflow-init
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@smartgrid.local
+    env_file: .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-grid}:${POSTGRES_PASSWORD:-gridpass}@postgres/${POSTGRES_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLt0nfdstI="
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      PYTHONPATH: /opt/pipeline
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./common:/opt/pipeline/common:ro
+      - ./batch:/opt/pipeline/batch:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-webserver:
+    image: smartgrid-airflow:latest
+    container_name: smartgrid-airflow-webserver
+    command: airflow webserver
+    env_file: .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-grid}:${POSTGRES_PASSWORD:-gridpass}@postgres/${POSTGRES_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLt0nfdstI="
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "smartgrid-secret"
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+      PYTHONPATH: /opt/pipeline
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./common:/opt/pipeline/common:ro
+      - ./batch:/opt/pipeline/batch:ro
+    ports:
+      - "8082:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    restart: on-failure
+
+  airflow-scheduler:
+    image: smartgrid-airflow:latest
+    container_name: smartgrid-airflow-scheduler
+    command: airflow scheduler
+    env_file: .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-grid}:${POSTGRES_PASSWORD:-gridpass}@postgres/${POSTGRES_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLt0nfdstI="
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+      PYTHONPATH: /opt/pipeline
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./common:/opt/pipeline/common:ro
+      - ./batch:/opt/pipeline/batch:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # Observability
+  # ---------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: smartgrid-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: smartgrid-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  kafka-data:
+  postgres-data:
+  minio-data:
+  spark-logs:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  default:
+    name: smartgrid-network
+    driver: bridge
