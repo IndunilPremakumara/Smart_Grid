@@ -10,14 +10,25 @@
 FROM apache/airflow:2.10.3-python3.11
 
 USER root
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-17-jre-headless \
+        wget \
+        gpg \
+        ca-certificates \
+    && mkdir -p /etc/apt/keyrings \
+    && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+        | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" \
+        > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        temurin-17-jre \
         curl \
         procps \
-        iproute2 \
+        netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV JAVA_HOME=/usr/lib/jvm/temurin-17-jre-amd64
 
 USER airflow
 
@@ -35,7 +46,7 @@ ENV SPARK_HOME=/home/airflow/.local/lib/python3.11/site-packages/pyspark
 ENV PATH="${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}" \
     PYTHONPATH=/opt/pipeline
 
-ARG MAVEN=https://repo1.maven.org/maven2
+ARG MAVEN=https://repo.maven.apache.org/maven2
 RUN set -eux; \
     for jar in \
       "org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.1/spark-sql-kafka-0-10_2.12-3.5.1.jar" \
@@ -43,9 +54,16 @@ RUN set -eux; \
       "org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar" \
       "org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar" \
       "org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar" \
-      "com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar" \
       "org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar" \
     ; do \
-      curl -fsSL --retry 5 --retry-delay 3 -o "${SPARK_HOME}/jars/$(basename "$jar")" "${MAVEN}/${jar}"; \
+      curl -fL --http1.1 --retry 5 --retry-delay 3 --retry-all-errors \
+        -o "${SPARK_HOME}/jars/$(basename "$jar")" "${MAVEN}/${jar}"; \
     done; \
+    path="com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar"; \
+    out="${SPARK_HOME}/jars/aws-java-sdk-bundle-1.12.262.jar"; \
+    curl -fL --http1.1 -C - --retry 20 --retry-delay 5 --retry-all-errors \
+      --connect-timeout 30 \
+      -o "$out" "${MAVEN}/${path}"; \
+    expected="$(curl -fsSL --http1.1 "${MAVEN}/${path}.sha1" | cut -d' ' -f1)"; \
+    echo "${expected}  ${out}" | sha1sum -c -; \
     test -x "${SPARK_HOME}/bin/spark-submit"

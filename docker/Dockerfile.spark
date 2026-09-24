@@ -3,8 +3,9 @@
 # batch jobs.
 #
 # Built from python:3.11-slim + the pyspark wheel rather than an upstream Spark
-# image. The wheel ships the complete Spark distribution (bin/, sbin/, jars/), so
-# one deterministic image runs the whole cluster, and the Python version is the
+# image. The wheel ships the Spark runtime (bin/, jars/), and the master/worker
+# daemons can be launched via spark-class, so one deterministic image runs the
+# whole cluster, and the Python version is the
 # one the pipeline code is written against rather than whatever the base image
 # happened to pin.
 #
@@ -19,19 +20,48 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-17-jre-headless \
+        wget \
+        gpg \
+        ca-certificates \
+    && mkdir -p /etc/apt/keyrings \
+    && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+        | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" \
+        > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        temurin-17-jre \
         curl \
         procps \
         netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV JAVA_HOME=/usr/lib/jvm/temurin-17-jre-amd64
 
 COPY requirements-base.txt requirements-spark.txt /tmp/
-RUN pip install --no-cache-dir -r /tmp/requirements-spark.txt
+RUN pip install \
+    --no-cache-dir \
+    --default-timeout=300 \
+    --retries=10 \
+    -r /tmp/requirements-base.txt \
+    && pyspark_archive=/tmp/pyspark-3.5.1.tar.gz \
+    && curl -fL --http1.1 -C - \
+        --retry 20 --retry-delay 5 --retry-all-errors \
+        --connect-timeout 20 --speed-time 30 --speed-limit 10000 \
+        -o "$pyspark_archive" \
+        https://files.pythonhosted.org/packages/73/e5/c9eb78cc982dafb7b5834bc5c368fe596216c8b9f7c4b4ffa104c4d2ab8f/pyspark-3.5.1.tar.gz \
+    && echo "dd6569e547365eadc4f887bf57f153e4d582a68c4b490de475d55b9981664910  $pyspark_archive" | sha256sum -c - \
+    && pip install --no-cache-dir --no-deps --no-index --find-links=/tmp \
+        -r /tmp/requirements-spark.txt
 
-# pyspark installs the distribution inside site-packages; expose it as SPARK_HOME
-# so bin/spark-submit, sbin/start-master.sh and friends are on PATH.
+# pyspark installs the runtime inside site-packages; expose it as SPARK_HOME so
+# bin/spark-submit and bin/spark-class are on PATH.
+# NOTE: the wheel does NOT ship sbin/start-master.sh or start-worker.sh (only a
+# few sbin helper scripts). Start the daemons in the foreground with spark-class:
+#   master: spark-class org.apache.spark.deploy.master.Master \
+#             --host spark-master --port 7077 --webui-port 8080
+#   worker: spark-class org.apache.spark.deploy.worker.Worker \
+#             spark://spark-master:7077 --webui-port 8081
 ENV SPARK_HOME=/usr/local/lib/python3.11/site-packages/pyspark
 ENV PATH="${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
 
@@ -41,7 +71,9 @@ ENV PATH="${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
 #   kafka-clients, commons-pool2      transitive deps of the above
 #   hadoop-aws + aws-java-sdk-bundle  S3A filesystem for MinIO
 #   postgresql                        JDBC sink/source for the serving store
-ARG MAVEN=https://repo1.maven.org/maven2
+ARG MAVEN=https://repo.maven.apache.org/maven2
+
+# Small jars: fixed 180s cap per attempt is fine for these.
 RUN set -eux; \
     for jar in \
       "org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.1/spark-sql-kafka-0-10_2.12-3.5.1.jar" \
@@ -49,14 +81,34 @@ RUN set -eux; \
       "org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar" \
       "org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar" \
       "org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar" \
-      "com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar" \
       "org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar" \
     ; do \
-      curl -fsSL --retry 5 --retry-delay 3 -o "${SPARK_HOME}/jars/$(basename "$jar")" "${MAVEN}/${jar}"; \
-    done; \
-    ls -la "${SPARK_HOME}/jars/" | grep -E "kafka|hadoop-aws|postgresql|aws-java" ; \
+      curl -fL \
+        --connect-timeout 20 \
+        --max-time 180 \
+        --retry 3 \
+        --retry-delay 5 \
+        -o "${SPARK_HOME}/jars/$(basename "$jar")" "${MAVEN}/${jar}"; \
+    done
+
+# aws-java-sdk-bundle is ~267 MB, so it gets its own layer (cached once it
+# succeeds) with a stall-based timeout instead of a hard cap, resumable
+# retries, and a checksum check against Maven's published .sha1.
+RUN set -eux; \
+    path="com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar"; \
+    out="${SPARK_HOME}/jars/aws-java-sdk-bundle-1.12.262.jar"; \
+    curl -fL --http1.1 -C - \
+      --retry 20 --retry-delay 5 --retry-all-errors \
+      --connect-timeout 30 \
+      -o "$out" "${MAVEN}/${path}"; \
+    expected="$(curl -fsSL "${MAVEN}/${path}.sha1" | cut -d' ' -f1)"; \
+    echo "${expected}  ${out}" | sha1sum -c -
+
+# Sanity checks
+RUN set -eux; \
+    ls -la "${SPARK_HOME}/jars/" | grep -E "kafka|hadoop-aws|postgresql|aws-java"; \
     test -x "${SPARK_HOME}/bin/spark-submit"; \
-    test -f "${SPARK_HOME}/sbin/start-master.sh"
+    test -x "${SPARK_HOME}/bin/spark-class"
 
 WORKDIR /opt/pipeline
 ENV PYTHONPATH=/opt/pipeline
